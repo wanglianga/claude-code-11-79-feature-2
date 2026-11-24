@@ -8,6 +8,7 @@ import Eligibility from './views/Eligibility.vue'
 import Deliveries from './views/Deliveries.vue'
 import Watermarks from './views/Watermarks.vue'
 import ConsentProtocol from './views/ConsentProtocol.vue'
+import Safety from './views/Safety.vue'
 import { setAuth } from './lib/api.js'
 
 const HOST = process.env.API_HOST || '127.0.0.1'
@@ -110,5 +111,19 @@ describe('SPA renders against the live API', () => {
     const w = mountView(Watermarks)
     await wait(1200)
     expect(w.html()).toMatch(/CN-02/)
+  })
+
+  it('Safety page reconstructs the P11 episode and its recurrence', async () => {
+    const w = mountView(Safety)
+    await wait(2500)
+    const text = w.text()
+    // the acceptance strip renders the reconstruction checks and they pass
+    expect(text).toContain('Safety episodes')
+    expect(text).toContain('reconstruction')
+    expect(text).toMatch(/E1|E2/)
+    // P11's participant appears in the domain-scoped episode table
+    expect(text).toContain('L-CN-01-011')
+    // a recurrence badge is rendered for the day-20 re-appearance
+    expect(text.toLowerCase()).toContain('recurrence')
   })
 })

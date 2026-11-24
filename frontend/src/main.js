@@ -11,6 +11,7 @@ import Watermarks from './views/Watermarks.vue'
 import Deliveries from './views/Deliveries.vue'
 import Revocation from './views/Revocation.vue'
 import Recovery from './views/Recovery.vue'
+import Safety from './views/Safety.vue'
 import Audit from './views/Audit.vue'
 import { getAuth } from './lib/api.js'
 
@@ -25,6 +26,7 @@ const routes = [
   { path: '/deliveries', component: Deliveries, meta: { title: 'Snapshots & deliveries' } },
   { path: '/revocation', component: Revocation, meta: { title: 'Withdrawal propagation' } },
   { path: '/recovery', component: Recovery, meta: { title: 'Recovery & quarantine' } },
+  { path: '/safety', component: Safety, meta: { title: 'Safety episodes' } },
   { path: '/audit', component: Audit, meta: { title: 'Audit trail' } }
 ]
 

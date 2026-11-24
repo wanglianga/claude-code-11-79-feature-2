@@ -6,6 +6,13 @@ protocol-version envelope. It implements the consent ledger, protocol catalogue,
 evaluator, watermark/back-fill coordination, snapshot delivery compiler, withdrawal propagator and post-outage
 recovery verifier, together with the acceptance scenario for subjects A/B/C/D at analysis day 16.
 
+On top of that it adds a **cross-source adverse-event episode reconstruction**: the same clinical process may be
+reported in a centre safety report, a hospital summary and a lab abnormality, so counting reports inflates the
+rate while a wide merge window swallows a post-resolution recurrence. The safety pipeline rebuilds episode
+periods per participant and comparable term, counts first and recurrent episodes against **observable treatment
+days**, and propagates linkage ambiguity into the rate interval. Identity is resolved only inside a residence
+domain; the global side receives only k-anonymised aggregates with uncertainty bands.
+
 Stack: **Vue 3 (Vite)** · **Spring Boot 3.5 / JDK** · **PostgreSQL**. Single page app is bundled into the Spring
 Boot jar and served together with the REST API.
 
@@ -16,7 +23,7 @@ Boot jar and served together with the REST API.
 ### Option A — Docker Compose (one command)
 
 ```bash
-cd /workspace/79
+cd /workspace/79-feature-2
 docker compose up --build
 # open http://localhost:8080   (Log in as admin / demo123)
 ```
@@ -63,13 +70,14 @@ All demo passwords are `demo123`. Roles are enforced server-side.
 | Username | Role | Can do |
 |----------|------|--------|
 | `admin`    | ADMIN | everything |
-| `global`   | GLOBAL_ANALYST (+AUDITOR) | compile cross-border deliveries, read snapshots |
-| `china`    | CN_ANALYST | drive watermark / transfer / link operations |
-| `auditor`  | AUDITOR | read-only audit, recovery, quarantine |
+| `global`   | GLOBAL_ANALYST (+AUDITOR) | compile cross-border deliveries, read snapshots, recompute safety episodes, publish any aggregate |
+| `china`    | CN_ANALYST | drive watermark / transfer / link operations, recompute safety episodes on the local plane |
+| `auditor`  | AUDITOR | read-only audit, recovery, quarantine, safety read views |
 | `sponsor`  | SPONSOR | record consent & protocol versions |
 
 Role checks that matter and were exercised: a China analyst gets **403** on `POST /api/deliveries/**`; an auditor
-gets **403** on `POST /api/consents`.
+gets **403** on `POST /api/consents`; a sponsor gets **403** on `POST /api/safety/reconstruct` (reconstruction is
+an analyst action).
 
 ---
 
@@ -127,34 +135,91 @@ summary and digests stay intact for audit — the delivery is not pretended to h
 
 ---
 
+## 4a. Cross-source safety-event reconstruction (analysis day 26)
+
+Study day 1 = `2026-03-02T09:00Z` (same clock). The safety scenario runs past the day-16 reference because the
+recurrence happens on D20 and the next dictionary edition becomes valid on D28. Open **Safety episodes** (its own
+analysis-day box defaults to 26; it does not inherit the workspace day-16 toggle).
+
+### Seeded source observations (residence domain `CN` / `SG`)
+
+| Participant | Sources and timing | Expected reconstruction |
+|-------------|--------------------|-------------------------|
+| **P11** (`L-CN-01-011`) | D3 centre safety report "nausea"; D4 hospital summary "nausea" (overlaps D3); D7 centre report "nausea" **resolved** + treatment interruption; **D20** centre report "nausea" again | D3+D4+D7 collapse to **one index episode**; D20 is a **second, recurrence** episode |
+| **P12** (`L-CN-01-012`) | D3 and D4 "nausea", same time window as P11, **different participant** | its own two reports merge; it is **never** linked to P11 |
+| **P13** (`L-CN-01-013`) | D5 "rash" (ends D5 18:00) + D5 "dermatitis" (same SOC, different PT) + a D7 follow-up note "rash" filed late, **no time overlap** | deterministic links dermatitis only by SOC via edge but splits the delayed rash note; probabilistic joins the delayed note to the D5 rash |
+| **P14** (`L-CN-01-014`) | D6 lab "neutropenia" → D6 centre "febrile neutropenia" (same HLT) | kept as an **ambiguous candidate**, never force-merged |
+| **P21/P22/P23** | nausea in CN-01, SG-01, CN-02 | give the nausea term ≥3 participants so it clears the k-anonymity floor and is publishable |
+
+### What the pipeline does
+
+* **Terminology mapping** pins a coding edition (MedDRA 25.1 active; 26.0 valid from D28). A mapping is used only
+  when the occurrence falls inside its validity window; an out-of-window occurrence is reported `OUT_OF_VALIDITY`
+  and excluded, never silently re-mapped.
+* **Episode linker** — *deterministic* clusters on same participant + same preferred term + explicit time overlap
+  (easy to audit, but a delayed back-report with a non-overlapping stamp is split in two). *Probabilistic* scores
+  term similarity (PT/HLT/SOC), time proximity, resolution (which argues for a **new** episode) and treatment
+  interruption (which supports one continuous episode); pairs inside `[0.50, 0.75)` are retained as **candidates**
+  and never force-merged.
+* **Counter** — the denominator is **observable treatment days** (interval length minus unobservable holds, capped
+  at the analysis day), never the nominal span. First (index) and recurrence rates are per 100 observable
+  person-days, and the rate interval widens to cover the merge-all / split-reversible recount, so linkage
+  ambiguity is propagated into the band.
+* **Versioning** — every run writes a new `SafetyEpisodeRun` + immutable `SafetyStatsVersion`. Re-running after a
+  mapping change produces a new version that `supersedes` the prior one by id; the prior digest is untouched and
+  **no parent-task `Delivery` / `EligibilityRow` is ever written**.
+* **Isolation** — participant identity is a hard gate and lives only inside a residence domain. `GET
+  /api/safety/observations?domain=CN` returns CN participants only; there is no cross-domain per-participant read.
+  The global plane receives only `GET /api/safety/aggregates/**`, where cells below the k-floor (k=3) are
+  suppressed and only the total is reported.
+
+### Safety acceptance checks (`GET /api/safety/acceptance?day=26`) — 7/7
+
+| Code | Proves |
+|------|--------|
+| **E1** | P11 D3+D4+D7 form one index episode (not four reports, not three) |
+| **E2** | P11 D20 is a second episode flagged as a recurrence after documented resolution |
+| **E3** | the same term/time from P12 is never linked to P11; P12's own reports still merge |
+| **X1** | denominator = observable treatment days (P11 observable 22 = nominal 25 − 3 unobservable) |
+| **P1** | the probabilistic strategy keeps ambiguous pairs as candidates and never force-merges |
+| **V1** | a mapping change creates a new version, leaves prior versions intact, writes nothing to the parent task |
+| **G1** | the global aggregate is k-anonymised (nausea published at ≥3 subjects, small cells suppressed), no identifiers |
+
+---
+
 ## 5. Verification (what was actually run here)
 
 All commands below were executed in this workspace against a live instance. Results are quoted verbatim.
 
-### 5.1 Backend integration tests — 15/15 pass
+### 5.1 Backend integration tests — 25/25 pass
 
 ```bash
 cd backend && mvn test
 ```
 ```
-Tests run: 15, Failures: 0, Errors: 0, Skipped: 0
+Tests run: 25, Failures: 0, Errors: 0, Skipped: 0
 BUILD SUCCESS
 ```
 Covers: A/B/C/D rules; intersection semantics; both reconstruction routes agreeing (read-only and persisted);
 stale-snapshot invalidation; transport dedupe; conflicting-duplicate quarantine; withdrawal/correction race
-quarantine; delivery projection has no identity fields and survives revocation as an intact summary.
+quarantine; delivery projection has no identity fields and survives revocation as an intact summary. Plus the 10
+safety tests: three-source single episode + recurrence; cross-participant non-linkage; observable-day denominator;
+ambiguous candidates never applied; deterministic-vs-probabilistic split/merge of a delayed report; mapping-change
+versioning with no parent write-back; k-anonymised aggregate; interval widening; all acceptance checks; and
+domain-scoped identity reads.
 
-### 5.2 Frontend render tests (live backend) — 7/7 pass
+### 5.2 Frontend render tests (live backend) — 8/8 pass
 
 ```bash
 cd frontend && npm run test        # vitest + happy-dom, mounts the real views against http://127.0.0.1:8080
 ```
 ```
 Test Files  1 passed (1)
-     Tests  7 passed (7)
+     Tests  8 passed (8)
 ```
 Asserts the Overview shows **15/15**, the Acceptance cards list A1/B1/C1/D2, the Eligibility pivot renders both
-planes and subject D as Pending, and the Consent / Deliveries / Watermarks views render without error.
+planes and subject D as Pending, the Consent / Deliveries / Watermarks views render without error, and the Safety
+view renders the P11 episode and recurrence with the acceptance strip.
 
 ### 5.3 End-to-end API acceptance (live jar)
 
@@ -174,6 +239,24 @@ planes and subject D as Pending, and the Consent / Deliveries / Watermarks views
 The pinned watermark string for day 16 is
 `CN-01:AE=15(src=15,ack=15); … CN-02:VISIT=12(src=12,ack=9)…` (the CN-02 analysis stays at 9).
 
+### 5.4 Safety reconstruction end-to-end (live jar, analysis day 26)
+
+| Step | Result |
+|------|--------|
+| `GET /api/safety/acceptance?day=26` | **7/7 checks pass** (E1, E2, E3, X1, P1, V1, G1) |
+| `POST /api/safety/reconstruct {strategy:DETERMINISTIC, version:25.1}` | `SR-DET-D26-001`, **11 episodes**, 0 candidates |
+| `POST /api/safety/reconstruct {strategy:PROBABILISTIC, version:25.1}` | `SR-PRB-D26-001`, **10 episodes**, **3 ambiguous candidates** (none applied) |
+| deterministic P11 members | index = `A,B,C`; recurrence #2 = `D` |
+| `GET /api/safety/stats` | 3 versions: `SV-D26-001` (25.1), `SV-D26-002` (25.1 prob), `SV-D26-003` (26.0, supersedes prior) |
+| `POST /api/safety/reconstruct {version:26.0}` then re-check | new `SV-D26-003` supersedes `SV-D26-002`; `SV-D26-001/002` digests unchanged; deliveries + eligibility row counts unchanged |
+| `POST /api/safety/aggregates/publish {statsCode:SV-D26-001, approvalCode:DUA-GLOBAL-01, kFloor:3}` | `AG-…-001`, **1 published / 4 suppressed**; Nausea 5 index / 1 recurrence over 104 subject-days, rate 4.808 [1.549, 11.219] per 100 person-days |
+| `GET /api/safety/observations?domain=SG` | only `L-SG-01-022` — no CN participant crosses the domain |
+| `GET /api/safety/observations` (no domain) | **400** — per-participant data is never returned undeclared |
+| `POST /api/safety/reconstruct` as `sponsor` | **403** |
+
+The exposure denominator for day 26 is **143 observable person-days** across 10 participants (P11 contributes 22
+of a nominal 25: three unobservable dose-hold days earn no credit).
+
 ---
 
 ## 6. Using the console
@@ -190,6 +273,11 @@ Open `http://localhost:8080` and sign in (the login screen lists the demo accoun
   fold analysis / break & restore link; run a recovery check.
 * **Deliveries** — compile by either route, inspect the pinned envelope, frozen member summary and projected
   records; revocation state is visible.
+* **Safety episodes** — the cross-source reconstruction. Select a residence domain, re-run the deterministic or
+  probabilistic linker, and inspect episodes, member observations, candidate edges and reasons, the observable-day
+  exposure denominator, per-term first/recurrence rates with uncertainty bands, the terminology editions, and the
+  k-anonymised global aggregate. This screen uses its own analysis-day box (default 26), independent of the
+  workspace day-16 toggle, because the safety scenario extends to D20/D28.
 * **Withdrawal** — propagate a recorded withdrawal, register disposition and tie-break rules, see executions.
 * **Recovery** — recovery reports (expand for per-domain digests), simulate a post-restore re-send, resolve
   quarantined races.
@@ -201,6 +289,9 @@ Open `http://localhost:8080` and sign in (the login screen lists the demo accoun
 2. As **admin**, Withdrawal → *Propagate* B's withdrawal.
 3. Back in Deliveries → open `DLV-D11-001`: content is revoked, but the frozen summary and digests remain.
 4. Set day `16`, Acceptances → all checks pass; Eligibility → D's D12 visit is Pending globally, available locally.
+5. Open **Safety episodes** (day 26): the acceptance strip shows 7/7; the deterministic table shows P11's
+   three-source index episode and its D20 recurrence; switch to **Probabilistic** to see the ambiguous candidates;
+   publish the k-anonymised global aggregate.
 
 ---
 
@@ -219,6 +310,13 @@ Open `http://localhost:8080` and sign in (the login screen lists the demo accoun
   the legal-member summary and digests are frozen and kept. Nothing claims the delivery never existed.
 * **Isolate, don't guess.** A withdrawal/correction race with equal effective instants and no registered
   tie-break rule is quarantined; it never silently picks a side.
+* **Episodes, not reports.** The safety counter divides reconstructed episodes by observable treatment days. The
+  same clinical process seen in three sources is one episode; a re-appearance after documented resolution is a
+  new recurrence. Ambiguous pairs are kept as candidates and widen the rate interval rather than being force-merged.
+* **Version, don't overwrite.** A terminology change produces a new stats version that supersedes the prior one; the
+  old digest is frozen, and nothing is written back to the parent task's deliveries or eligibility rows.
+* **Identity stays in its domain.** Participant keys are resolved only inside a residence domain; the global plane
+  receives k-anonymised aggregates only, with small cells suppressed.
 
 ---
 
@@ -227,13 +325,16 @@ Open `http://localhost:8080` and sign in (the login screen lists the demo accoun
 ```
 backend/
   src/main/java/com/ctrial/
-    model/        JPA entities + Enums (the rule vocabulary)
+    model/        JPA entities + Enums (the rule vocabulary) + Safety* entities
     service/      EligibilityEngine (pure), EligibilityService, EligibilityRunService,
                   DeliveryService, RevocationService, RecoveryService, EventIngestService,
                   StateService, AcceptanceService, AuditService
-    web/          ReadController, CommandController, SpaConfig
-    config/       SecurityConfig, DemoSeeder
-  src/test/java/com/ctrial/AcceptanceRulesTest.java
+    service/safety/  TerminologyMapper, EpisodeLinker (pure), LocalSafetyResolver (pure),
+                     SafetyRateCalculator (pure), SafetyReconstructionService,
+                     SafetyAggregateService, SafetyQueryService, SafetyAcceptanceService
+    web/          ReadController, CommandController, SafetyController, SpaConfig
+    config/       SecurityConfig, DemoSeeder, SafetyDemoSeeder
+  src/test/java/com/ctrial/AcceptanceRulesTest.java, SafetyReconstructionTest.java
 frontend/
   src/            App, views/*, components/*, lib/api.js, lib/store.js, ui.test.js
 Dockerfile, compose.yaml

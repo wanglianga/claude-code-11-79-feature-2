@@ -54,6 +54,9 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.GET, "/api/**").hasAnyRole(ROLES)
                         // only a global analyst (or admin) may compile cross-border deliveries
                         .requestMatchers(HttpMethod.POST, "/api/deliveries/**").hasAnyRole("GLOBAL_ANALYST", "ADMIN")
+                        // safety recompute + global aggregate publishing: global analyst / admin
+                        .requestMatchers(HttpMethod.POST, "/api/safety/reconstruct", "/api/safety/aggregates/**")
+                        .hasAnyRole("GLOBAL_ANALYST", "ADMIN", "CN_ANALYST")
                         // only China analysts / admins may push source-side watermark ops
                         .requestMatchers(HttpMethod.POST, "/api/watermarks/**").hasAnyRole("CN_ANALYST", "ADMIN")
                         // consent + event ingestion restricted to admin in this demo
